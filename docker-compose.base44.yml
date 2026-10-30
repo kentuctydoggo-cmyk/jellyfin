@@ -1,0 +1,104 @@
+# Development stack for the Jellyfin server (Base44 sandbox).
+#
+#   webclient : one-shot job that builds the jellyfin-web frontend from upstream
+#               master (the same version as this server checkout) into the
+#               `jellyfin-web` volume. Skipped on later starts once built.
+#   jellyfin  : the server itself, built and run from the bind-mounted source with
+#               `dotnet watch` (hot reload). Serves the web client from /web.
+#
+# Host port 3000 -> container 8096 (Jellyfin's default HTTP port).
+# App state (config, database, metadata, logs) lives in the `jellyfin-data` volume.
+name: jellyfin-base44
+
+services:
+  webclient:
+    image: node:24
+    labels:
+      base44.project: "Jellyfin Web Client"
+      base44.kind: worker
+    working_dir: /tmp/jellyfin-web
+    volumes:
+      - jellyfin-web:/web
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -f /web/index.html ]; then
+          echo "jellyfin-web already built, skipping"
+          exit 0
+        fi
+        mkdir -p /tmp/jellyfin-web
+        curl -fsSL https://github.com/jellyfin/jellyfin-web/archive/refs/heads/master.tar.gz \
+          | tar -xz -C /tmp/jellyfin-web --strip-components=1
+        # The webpack config reads the commit sha with `git describe`, so the
+        # downloaded source tree needs to be a git repository.
+        if [ ! -d .git ]; then
+          git init -q .
+          git -c user.email=base44@example.com -c user.name=base44 add -A
+          git -c user.email=base44@example.com -c user.name=base44 commit -qm "jellyfin-web source"
+        fi
+        if [ -f package-lock.json ]; then
+          npm ci --no-audit --no-fund
+        else
+          npm install --no-audit --no-fund
+        fi
+        npm run build:production
+        cp -a dist/. /web/
+        test -f /web/index.html
+        echo "jellyfin-web built from master"
+    restart: "no"
+
+  jellyfin:
+    build:
+      context: .
+      dockerfile: .base44/Dockerfile
+    image: base44/jellyfin-server-dev
+    labels:
+      base44.project: "Jellyfin Server"
+      base44.kind: web
+      base44.port: "3000"
+      base44.docs: "/api-docs/swagger/index.html"
+    ports:
+      - "3000:8096"
+    depends_on:
+      webclient:
+        condition: service_completed_successfully
+    volumes:
+      - .:/src
+      - jellyfin-data:/data
+      - jellyfin-web:/web:ro
+      - nuget-packages:/root/.nuget/packages
+      # Keeps ASP.NET data-protection keys so user sessions survive a restart.
+      - data-protection-keys:/root/.aspnet/DataProtection-Keys
+      # Keeps MSBuild intermediates/assemblies outside the bind-mounted repo.
+      - build-artifacts:/artifacts
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ArtifactsPath=/artifacts
+      - DOTNET_USE_POLLING_FILE_WATCHER=1
+      - JELLYFIN_DATA_DIR=/data
+      - JELLYFIN_CONFIG_DIR=/data/config
+      - JELLYFIN_CACHE_DIR=/data/cache
+      - JELLYFIN_LOG_DIR=/data/log
+      - JELLYFIN_WEB_DIR=/web
+    command:
+      - sh
+      - -ec
+      - |
+        dotnet restore Jellyfin.Server/Jellyfin.Server.csproj
+        exec dotnet watch --project Jellyfin.Server/Jellyfin.Server.csproj run --no-launch-profile -- --nonetchange
+    healthcheck:
+      # /health is Jellyfin's own health endpoint and is available during startup too.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8096/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 600s
+    restart: on-failure
+
+volumes:
+  jellyfin-data:
+  jellyfin-web:
+  nuget-packages:
+  build-artifacts:
+  data-protection-keys:
